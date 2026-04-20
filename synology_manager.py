@@ -1,7 +1,7 @@
 import sqlite3
 import requests
 import json
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, List, Tuple
 import urllib3
 from datetime import datetime
 import base64
@@ -30,6 +30,7 @@ class DatabaseManager:
                 dsm_user            TEXT NOT NULL,
                 dsm_password_enc    TEXT NOT NULL,
                 location            TEXT DEFAULT '',
+                direct_url          TEXT DEFAULT '',
                 enable_alerts       INTEGER DEFAULT 1,
                 check_interval      INTEGER DEFAULT 6,
                 last_checked        TEXT,
@@ -81,15 +82,18 @@ class DatabaseManager:
         conn.close()
         return [dict(r) for r in rows]
 
-    def add_nas(self, name, qc_id, user, password, location='', enable_alerts=True) -> bool:
+    def add_nas(self, name, qc_id, user, password, location='',
+                direct_url='', enable_alerts=True) -> bool:
         try:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             enc = self.encrypt_password(password)
             c.execute("""
-                INSERT INTO nas (name, qc_id, dsm_user, dsm_password_enc, location, enable_alerts)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (name, qc_id, user, enc, location, 1 if enable_alerts else 0))
+                INSERT INTO nas (name, qc_id, dsm_user, dsm_password_enc,
+                                 location, direct_url, enable_alerts)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, qc_id, user, enc, location, direct_url,
+                  1 if enable_alerts else 0))
             conn.commit()
             conn.close()
             return True
@@ -105,16 +109,17 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
-    def update_nas(self, nas_id, name, qc_id, user, password, location='', enable_alerts=True):
+    def update_nas(self, nas_id, name, qc_id, user, password,
+                   location='', direct_url='', enable_alerts=True):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         enc = self.encrypt_password(password)
         c.execute("""
             UPDATE nas SET name=?, qc_id=?, dsm_user=?, dsm_password_enc=?,
-                           location=?, enable_alerts=?, updated_at=?
+                           location=?, direct_url=?, enable_alerts=?, updated_at=?
             WHERE id=?
-        """, (name, qc_id, user, enc, location, 1 if enable_alerts else 0,
-              datetime.now().isoformat(), nas_id))
+        """, (name, qc_id, user, enc, location, direct_url,
+              1 if enable_alerts else 0, datetime.now().isoformat(), nas_id))
         conn.commit()
         conn.close()
 
@@ -191,7 +196,8 @@ class DatabaseManager:
         try:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
-            c.execute('UPDATE nas SET last_checked=? WHERE id=?', (datetime.now().isoformat(), nas_id))
+            c.execute('UPDATE nas SET last_checked=? WHERE id=?',
+                      (datetime.now().isoformat(), nas_id))
             conn.commit()
             conn.close()
             return True
@@ -205,31 +211,45 @@ class DatabaseManager:
 
 class SynologyManager:
     def __init__(self, db_manager=None):
-        self.sessions  = {}   # qc_id -> session info
-        self.base_urls = {}   # qc_id -> URL réelle résolue
-        self.db        = db_manager or DatabaseManager()
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Résolution QuickConnect → IP/URL réelle du NAS
-    # ─────────────────────────────────────────────────────────────────────
+        self.sessions = {}
+        self.db       = db_manager or DatabaseManager()
 
     def _clean_qc_id(self, qc_id: str) -> str:
-        """Extrait l'ID pur depuis une URL ou un ID brut"""
         qc_id = qc_id.strip()
-        for prefix in ["https://", "http://"]:
-            qc_id = qc_id.replace(prefix, "")
+        for p in ["https://", "http://"]:
+            qc_id = qc_id.replace(p, "")
         qc_id = qc_id.replace("QuickConnect.to/", "")
         qc_id = qc_id.replace("quickconnect.to", "")
         return qc_id.strip("/")
 
-    def _resolve_quickconnect(self, qc_id: str, logs: list) -> List[str]:
+    def _build_candidate_urls(self, direct_url: str, qc_id: str, logs: list) -> List[str]:
         """
-        Appelle l'API relay Synology pour obtenir les URLs directes du NAS.
-        Retourne une liste d'URLs à essayer dans l'ordre.
+        Construit la liste des URLs à tester dans l'ordre:
+        1. URL directe fournie par l'utilisateur (la plus fiable)
+        2. Relay QuickConnect Synology
         """
         urls = []
+
+        # ── 1. URL directe ────────────────────────────────────────────────
+        if direct_url and direct_url.strip():
+            raw = direct_url.strip().rstrip("/")
+            # Ajouter le schéma si absent
+            if not raw.startswith("http"):
+                urls.append(f"http://{raw}:5000")
+                urls.append(f"https://{raw}:5001")
+                urls.append(f"http://{raw}")
+            else:
+                urls.append(raw)
+                # Essayer aussi le port DSM standard si pas de port
+                if ":" not in raw.split("//")[-1]:
+                    base = raw.rstrip("/")
+                    urls.append(f"{base}:5000")
+                    urls.append(f"{base}:5001")
+            logs.append(f"🏠 URL directe : `{direct_url}`")
+
+        # ── 2. Relay QuickConnect ─────────────────────────────────────────
+        logs.append(f"🔍 Interrogation du relay Synology pour `{qc_id}`…")
         try:
-            logs.append(f"🔍 Résolution QuickConnect pour `{qc_id}` via relay Synology…")
             relay = "https://global.quickconnect.to/Serv.php"
             payload = {
                 "version": 1,
@@ -238,190 +258,182 @@ class SynologyManager:
                 "stop_when_success": False,
                 "id": "qc_direct",
                 "serverID": qc_id,
-                "is_gofile": False
+                "is_gofile": False,
             }
             r = requests.post(relay, json=payload, timeout=10, verify=False)
             data = r.json()
+
+            # ── Log de la réponse brute (utile pour déboguer) ─────────────
+            logs.append(f"📨 Réponse relay brute : `{json.dumps(data)[:400]}`")
+
             server = data.get("server", {})
+            env    = data.get("env",    {})
 
-            if not server:
-                logs.append("⚠️ Relay n'a pas retourné d'infos serveur")
-                return urls
-
-            # 1. IP externe
+            # IP externe
             ext_ip = server.get("external", {}).get("ip", "")
             if ext_ip:
-                logs.append(f"📡 IP externe trouvée : `{ext_ip}`")
-                urls.append(f"https://{ext_ip}:5001")
-                urls.append(f"http://{ext_ip}:5000")
+                logs.append(f"📡 IP externe : `{ext_ip}`")
+                urls += [f"https://{ext_ip}:5001", f"http://{ext_ip}:5000"]
 
-            # 2. DDNS Synology
+            # DDNS Synology (.synology.me)
             ddns = server.get("ddns", "")
-            if ddns and ddns not in ("NULL", ""):
-                logs.append(f"🌐 DDNS trouvé : `{ddns}`")
-                urls.append(f"https://{ddns}:5001")
-                urls.append(f"http://{ddns}:5000")
+            if ddns and ddns not in ("NULL", "", "null"):
+                logs.append(f"🌐 DDNS : `{ddns}`")
+                urls += [f"https://{ddns}:5001", f"http://{ddns}:5000"]
 
-            # 3. FQDN personnalisé
+            # FQDN custom
             fqdn = server.get("fqdn", "")
-            if fqdn and fqdn not in ("NULL", ""):
-                logs.append(f"🌐 FQDN trouvé : `{fqdn}`")
-                urls.append(f"https://{fqdn}:5001")
-                urls.append(f"http://{fqdn}:5000")
+            if fqdn and fqdn not in ("NULL", "", "null"):
+                logs.append(f"🌐 FQDN : `{fqdn}`")
+                urls += [f"https://{fqdn}:5001", f"http://{fqdn}:5000"]
 
-            # 4. IPs LAN (utile si même réseau)
+            # IPs LAN
             for iface in server.get("interface", []):
-                lan_ip = iface.get("ip", "")
-                if lan_ip:
-                    logs.append(f"🏠 IP LAN trouvée : `{lan_ip}`")
-                    urls.append(f"http://{lan_ip}:5000")
-                    urls.append(f"https://{lan_ip}:5001")
+                ip = iface.get("ip", "")
+                if ip:
+                    logs.append(f"🏠 IP LAN : `{ip}`")
+                    urls += [f"http://{ip}:5000", f"https://{ip}:5001"]
+
+            # Relay tunnel Synology (dernier recours)
+            relay_ip = env.get("relay_ip", "")
+            relay_port = env.get("relay_port", "")
+            if relay_ip and relay_port:
+                logs.append(f"🔀 Relay tunnel : `{relay_ip}:{relay_port}`")
+                urls.append(f"http://{relay_ip}:{relay_port}")
 
         except Exception as e:
             logs.append(f"⚠️ Erreur relay : `{e}`")
 
-        return urls
+        # Dédupliquer en gardant l'ordre
+        seen = set()
+        unique = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                unique.append(u)
 
-    def _try_auth(self, base_url: str, username: str, password: str,
-                  logs: list) -> Tuple[bool, Optional[requests.Session], Optional[str]]:
-        """
-        Tente une authentification DSM sur base_url.
-        Retourne (succès, session, sid).
-        """
+        if not unique:
+            logs.append("❌ Aucune URL candidate trouvée")
+        else:
+            logs.append(f"✅ {len(unique)} URL(s) à tester")
+
+        return unique
+
+    def _try_auth(self, base_url: str, username: str,
+                  password: str, logs: list) -> Tuple[bool, object, str]:
+        """Tente une auth DSM. Retourne (ok, session, sid)."""
         try:
             session = requests.Session()
             session.verify = False
-            auth_url = f"{base_url}/webapi/auth.cgi"
+            url = f"{base_url}/webapi/auth.cgi"
             params = {
-                "api":     "SYNO.API.Auth",
-                "version": "3",
-                "method":  "login",
-                "account": username,
-                "passwd":  password,
-                "session": "SynologyManager",
-                "format":  "json",
+                "api": "SYNO.API.Auth", "version": "3", "method": "login",
+                "account": username, "passwd": password,
+                "session": "NASManager", "format": "json",
             }
-            logs.append(f"🔗 Essai : `{auth_url}`")
-            resp = session.get(auth_url, params=params, timeout=8, verify=False)
+            logs.append(f"   🔗 `{base_url}`")
+            resp = session.get(url, params=params, timeout=8, verify=False)
 
-            # Vérifie que c'est bien du JSON (pas du HTML)
+            # Rejeter HTML
             ct = resp.headers.get("Content-Type", "")
             if "html" in ct or resp.text.strip().startswith("<!"):
-                logs.append(f"   ↳ ❌ Réponse HTML (pas le bon endpoint)")
+                logs.append("      ↳ ❌ HTML reçu (mauvais endpoint)")
                 return False, None, None
 
             data = resp.json()
             if data.get("success"):
-                sid = data.get("data", {}).get("sid")
+                sid = data.get("data", {}).get("sid", "")
                 if sid:
-                    logs.append(f"   ↳ ✅ Authentification réussie!")
+                    logs.append("      ↳ ✅ Authentification réussie!")
                     return True, session, sid
 
             code = data.get("error", {}).get("code", "?")
-            msg = {
-                400: "Identifiants invalides",
-                401: "Compte désactivé",
-                402: "Permission refusée",
-                403: "2FA requis",
-                407: "IP bloquée",
-            }.get(code, f"Erreur DSM code {code}")
-            logs.append(f"   ↳ ❌ {msg}")
+            msg  = {400: "Identifiants invalides", 401: "Compte désactivé",
+                    402: "Permission refusée",    403: "2FA requis",
+                    407: "IP bloquée"}.get(code, f"Code DSM {code}")
+            logs.append(f"      ↳ ❌ {msg}")
             return False, None, None
 
         except requests.exceptions.ConnectionError:
-            logs.append(f"   ↳ ❌ Injoignable")
+            logs.append("      ↳ ❌ Injoignable")
             return False, None, None
         except requests.exceptions.Timeout:
-            logs.append(f"   ↳ ❌ Timeout")
+            logs.append("      ↳ ❌ Timeout (8s)")
             return False, None, None
         except Exception as e:
-            logs.append(f"   ↳ ❌ Erreur : `{e}`")
+            logs.append(f"      ↳ ❌ `{e}`")
             return False, None, None
 
-    # ─────────────────────────────────────────────────────────────────────
-    # API publique
-    # ─────────────────────────────────────────────────────────────────────
+    # ── API publique ──────────────────────────────────────────────────────
 
-    def verify_connection_debug(self, qc_id: str, username: str, password: str) -> dict:
-        """Connexion avec logs détaillés. Retourne {success, logs, error}."""
-        logs = []
+    def verify_connection_debug(self, qc_id: str, username: str,
+                                password: str, direct_url: str = "") -> dict:
+        logs  = []
         qc_id = self._clean_qc_id(qc_id)
-        logs.append(f"✅ Quick Connect ID nettoyé : `{qc_id}`")
+        logs.append(f"✅ ID nettoyé : `{qc_id}`")
 
-        # Résoudre les URLs via relay
-        urls = self._resolve_quickconnect(qc_id, logs)
-
+        urls = self._build_candidate_urls(direct_url, qc_id, logs)
         if not urls:
-            logs.append("❌ Aucune URL trouvée via le relay Synology")
-            return {"success": False, "logs": logs, "error": "Aucune URL résolue"}
+            return {"success": False, "logs": logs, "error": "Aucune URL candidate"}
 
-        logs.append(f"✅ {len(urls)} URL(s) à tester")
-
-        # Tester chaque URL dans l'ordre
+        logs.append("--- Tentatives de connexion ---")
         for url in urls:
             ok, session, sid = self._try_auth(url, username, password, logs)
             if ok:
                 self.sessions[qc_id] = {
-                    "session":  session,
-                    "sid":      sid,
-                    "username": username,
-                    "password": password,
+                    "session": session, "sid": sid,
+                    "username": username, "password": password,
                     "base_url": url,
                 }
-                self.base_urls[qc_id] = url
                 logs.append(f"✅ Connexion établie via `{url}`")
                 return {"success": True, "logs": logs, "error": None}
 
-        logs.append("❌ Aucune URL n'a fonctionné")
-        return {"success": False, "logs": logs, "error": "Toutes les URLs ont échoué"}
+        return {"success": False, "logs": logs,
+                "error": "Toutes les URLs ont échoué"}
 
-    def verify_connection(self, qc_id: str, username: str, password: str) -> bool:
-        return self.verify_connection_debug(qc_id, username, password)["success"]
+    def verify_connection(self, qc_id: str, username: str,
+                          password: str, direct_url: str = "") -> bool:
+        return self.verify_connection_debug(qc_id, username, password, direct_url)["success"]
 
-    def _get_session(self, qc_id: str, username: str, password: str):
-        """Retourne la session active ou en crée une nouvelle."""
+    def _get_session(self, qc_id, username, password, direct_url=""):
         qc_id = self._clean_qc_id(qc_id)
         if qc_id not in self.sessions:
-            self.verify_connection(qc_id, username, password)
+            self.verify_connection(qc_id, username, password, direct_url)
         return self.sessions.get(qc_id)
 
-    def check_server_status(self, qc_id, username, password):
+    def check_server_status(self, qc_id, username, password, direct_url=""):
         try:
             qc_id = self._clean_qc_id(qc_id)
-            sd = self._get_session(qc_id, username, password)
+            sd = self._get_session(qc_id, username, password, direct_url)
             if not sd:
-                return {"is_online": False, "error": "Connexion échouée"}
+                return {"is_online": False}
             resp = sd["session"].get(
                 f"{sd['base_url']}/webapi/query.cgi",
                 params={"api": "SYNO.DSM.Info", "version": "2",
                         "method": "getinfo", "_sid": sd["sid"]},
-                timeout=10, verify=False
-            )
+                timeout=10, verify=False)
             data = resp.json()
             if data.get("success"):
                 info = data.get("data", {})
-                return {
-                    "is_online":   True,
-                    "dsm_version": info.get("dsm_version"),
-                    "hostname":    info.get("hostname"),
-                    "uptime":      info.get("uptime"),
-                }
+                return {"is_online": True,
+                        "dsm_version": info.get("dsm_version"),
+                        "hostname":    info.get("hostname"),
+                        "uptime":      info.get("uptime")}
             return {"is_online": False}
         except Exception as e:
             return {"is_online": False, "error": str(e)}
 
-    def check_updates(self, qc_id, username, password):
+    def check_updates(self, qc_id, username, password, direct_url=""):
         try:
             qc_id = self._clean_qc_id(qc_id)
-            sd = self._get_session(qc_id, username, password)
+            sd = self._get_session(qc_id, username, password, direct_url)
             if not sd:
                 return None
             resp = sd["session"].get(
                 f"{sd['base_url']}/webapi/query.cgi",
                 params={"api": "SYNO.DSM.Software", "version": "3",
                         "method": "check", "_sid": sd["sid"]},
-                timeout=10, verify=False
-            )
+                timeout=10, verify=False)
             data = resp.json()
             if data.get("success") and data.get("data", {}).get("update_available"):
                 return [{"type": "dsm",
@@ -431,46 +443,41 @@ class SynologyManager:
         except:
             return None
 
-    def install_updates(self, qc_id, username, password) -> bool:
+    def install_updates(self, qc_id, username, password, direct_url="") -> bool:
         try:
             qc_id = self._clean_qc_id(qc_id)
-            sd = self._get_session(qc_id, username, password)
+            sd = self._get_session(qc_id, username, password, direct_url)
             if not sd:
                 return False
             resp = sd["session"].get(
                 f"{sd['base_url']}/webapi/query.cgi",
                 params={"api": "SYNO.DSM.Software", "version": "3",
                         "method": "install", "_sid": sd["sid"]},
-                timeout=10, verify=False
-            )
+                timeout=10, verify=False)
             return resp.json().get("success", False)
         except:
             return False
 
-    def get_system_alerts(self, qc_id, username, password):
+    def get_system_alerts(self, qc_id, username, password, direct_url=""):
         try:
             qc_id = self._clean_qc_id(qc_id)
-            sd = self._get_session(qc_id, username, password)
+            sd = self._get_session(qc_id, username, password, direct_url)
             if not sd:
                 return []
             alerts = []
-            try:
-                r = sd["session"].get(
-                    f"{sd['base_url']}/webapi/query.cgi",
-                    params={"api": "SYNO.System.Event.Service", "version": "1",
-                            "method": "get", "_sid": sd["sid"]},
-                    timeout=10, verify=False
-                )
-                data = r.json()
-                if data.get("success"):
-                    for event in data.get("data", {}).get("events", []):
-                        if event.get("severity") in ["critical", "major"]:
-                            alerts.append({
-                                "type":    "error" if event["severity"] == "critical" else "warning",
-                                "message": event.get("description", "Alerte système"),
-                            })
-            except:
-                pass
+            r = sd["session"].get(
+                f"{sd['base_url']}/webapi/query.cgi",
+                params={"api": "SYNO.System.Event.Service", "version": "1",
+                        "method": "get", "_sid": sd["sid"]},
+                timeout=10, verify=False)
+            data = r.json()
+            if data.get("success"):
+                for event in data.get("data", {}).get("events", []):
+                    if event.get("severity") in ["critical", "major"]:
+                        alerts.append({
+                            "type":    "error" if event["severity"] == "critical" else "warning",
+                            "message": event.get("description", "Alerte système"),
+                        })
             return alerts
         except:
             return []
@@ -485,8 +492,7 @@ class SynologyManager:
                 f"{sd['base_url']}/webapi/auth.cgi",
                 params={"api": "SYNO.API.Auth", "version": "1",
                         "method": "logout", "_sid": sd["sid"]},
-                timeout=10, verify=False
-            )
+                timeout=10, verify=False)
             del self.sessions[qc_id]
             return True
         except:
