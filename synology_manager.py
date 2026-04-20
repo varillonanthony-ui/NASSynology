@@ -228,35 +228,10 @@ class SynologyManager:
         qc_id = qc_id.replace("quickconnect.to", "")
         return qc_id.strip("/")
 
-    def _build_candidate_urls(self, direct_url: str, qc_id: str, logs: list) -> List[str]:
-        """
-        Construit la liste des URLs à tester dans l'ordre:
-        1. URL directe fournie par l'utilisateur (la plus fiable)
-        2. Relay QuickConnect Synology
-        """
-        urls = []
-
-        # ── 1. URL directe ────────────────────────────────────────────────
-        if direct_url and direct_url.strip():
-            raw = direct_url.strip().rstrip("/")
-            # Ajouter le schéma si absent
-            if not raw.startswith("http"):
-                urls.append(f"http://{raw}:5000")
-                urls.append(f"https://{raw}:5001")
-                urls.append(f"http://{raw}")
-            else:
-                urls.append(raw)
-                # Essayer aussi le port DSM standard si pas de port
-                if ":" not in raw.split("//")[-1]:
-                    base = raw.rstrip("/")
-                    urls.append(f"{base}:5000")
-                    urls.append(f"{base}:5001")
-            logs.append(f"🏠 URL directe : `{direct_url}`")
-
-        # ── 2. Relay QuickConnect ─────────────────────────────────────────
-        logs.append(f"🔍 Interrogation du relay Synology pour `{qc_id}`…")
+    def _query_relay(self, relay_host: str, qc_id: str, logs: list) -> dict:
+        """Interroge un serveur relay Synology spécifique."""
         try:
-            relay = "https://global.quickconnect.to/Serv.php"
+            url = f"https://{relay_host}/Serv.php"
             payload = {
                 "version": 1,
                 "command": "get_server_info",
@@ -266,53 +241,92 @@ class SynologyManager:
                 "serverID": qc_id,
                 "is_gofile": False,
             }
-            r = requests.post(relay, json=payload, timeout=10, verify=False)
+            r = requests.post(url, json=payload, timeout=10, verify=False)
             data = r.json()
-
-            # ── Log de la réponse brute (utile pour déboguer) ─────────────
-            logs.append(f"📨 Réponse relay brute : `{json.dumps(data)[:400]}`")
-
-            server = data.get("server", {})
-            env    = data.get("env",    {})
-
-            # IP externe
-            ext_ip = server.get("external", {}).get("ip", "")
-            if ext_ip:
-                logs.append(f"📡 IP externe : `{ext_ip}`")
-                urls += [f"https://{ext_ip}:5001", f"http://{ext_ip}:5000"]
-
-            # DDNS Synology (.synology.me)
-            ddns = server.get("ddns", "")
-            if ddns and ddns not in ("NULL", "", "null"):
-                logs.append(f"🌐 DDNS : `{ddns}`")
-                urls += [f"https://{ddns}:5001", f"http://{ddns}:5000"]
-
-            # FQDN custom
-            fqdn = server.get("fqdn", "")
-            if fqdn and fqdn not in ("NULL", "", "null"):
-                logs.append(f"🌐 FQDN : `{fqdn}`")
-                urls += [f"https://{fqdn}:5001", f"http://{fqdn}:5000"]
-
-            # IPs LAN
-            for iface in server.get("interface", []):
-                ip = iface.get("ip", "")
-                if ip:
-                    logs.append(f"🏠 IP LAN : `{ip}`")
-                    urls += [f"http://{ip}:5000", f"https://{ip}:5001"]
-
-            # Relay tunnel Synology (dernier recours)
-            relay_ip = env.get("relay_ip", "")
-            relay_port = env.get("relay_port", "")
-            if relay_ip and relay_port:
-                logs.append(f"🔀 Relay tunnel : `{relay_ip}:{relay_port}`")
-                urls.append(f"http://{relay_ip}:{relay_port}")
-
+            logs.append(f"📨 `{relay_host}` → `{json.dumps(data)[:300]}`")
+            return data
         except Exception as e:
-            logs.append(f"⚠️ Erreur relay : `{e}`")
+            logs.append(f"⚠️ `{relay_host}` injoignable : `{e}`")
+            return {}
 
-        # Dédupliquer en gardant l'ordre
-        seen = set()
-        unique = []
+    def _extract_urls_from_relay(self, data: dict, logs: list) -> List[str]:
+        """Extrait les URLs candidates depuis une réponse relay."""
+        urls = []
+        server = data.get("server", {})
+        env    = data.get("env",    {})
+
+        # IP externe
+        ext_ip = server.get("external", {}).get("ip", "")
+        if ext_ip:
+            logs.append(f"📡 IP externe : `{ext_ip}`")
+            for port in [5001, 5000, 443, 80, 8443, 8080]:
+                scheme = "https" if port in (5001, 443, 8443) else "http"
+                urls.append(f"{scheme}://{ext_ip}:{port}")
+
+        # DDNS Synology (.synology.me ou autre)
+        ddns = server.get("ddns", "")
+        if ddns and ddns not in ("NULL", "", "null"):
+            logs.append(f"🌐 DDNS : `{ddns}`")
+            for port in [5001, 5000, 443, 80]:
+                scheme = "https" if port in (5001, 443) else "http"
+                urls.append(f"{scheme}://{ddns}:{port}")
+
+        # FQDN custom
+        fqdn = server.get("fqdn", "")
+        if fqdn and fqdn not in ("NULL", "", "null"):
+            logs.append(f"🌐 FQDN : `{fqdn}`")
+            urls += [f"https://{fqdn}:5001", f"http://{fqdn}:5000"]
+
+        # IPs LAN
+        for iface in server.get("interface", []):
+            ip = iface.get("ip", "")
+            if ip:
+                logs.append(f"🏠 IP LAN : `{ip}`")
+                urls += [f"http://{ip}:5000", f"https://{ip}:5001"]
+
+        # Tunnel relay (dernier recours)
+        relay_ip   = env.get("relay_ip",   "")
+        relay_port = env.get("relay_port", "")
+        if relay_ip and relay_port:
+            logs.append(f"🔀 Tunnel relay : `{relay_ip}:{relay_port}`")
+            urls.append(f"http://{relay_ip}:{relay_port}")
+
+        return urls
+
+    def _build_candidate_urls(self, direct_url: str, qc_id: str, logs: list) -> List[str]:
+        """
+        Construit la liste des URLs à tester dans l'ordre:
+        1. URL directe fournie par l'utilisateur
+        2. Relay global Synology
+        3. Relay régional retourné par le relay global
+        """
+        urls = []
+
+        # ── 1. URL directe (essayer plusieurs ports) ──────────────────────
+        if direct_url and direct_url.strip():
+            raw = direct_url.strip().rstrip("/").replace("https://","").replace("http://","")
+            logs.append(f"🏠 URL directe : `{raw}` — test sur plusieurs ports")
+            for port in [5000, 5001, 80, 443, 8080, 8443]:
+                scheme = "https" if port in (5001, 443, 8443) else "http"
+                urls.append(f"{scheme}://{raw}:{port}")
+            urls.append(f"http://{raw}")
+
+        # ── 2. Relay global puis régional ────────────────────────────────
+        logs.append(f"🔍 Interrogation du relay global pour `{qc_id}`…")
+        data = self._query_relay("global.quickconnect.to", qc_id, logs)
+
+        # Si errno != 0 → le relay indique un serveur régional
+        if data.get("errno", 0) != 0:
+            sites = data.get("sites", [])
+            if sites:
+                logs.append(f"🔄 Redirection vers serveur régional : `{sites[0]}`")
+                data = self._query_relay(sites[0], qc_id, logs)
+
+        relay_urls = self._extract_urls_from_relay(data, logs)
+        urls.extend(relay_urls)
+
+        # Dédupliquer
+        seen, unique = set(), []
         for u in urls:
             if u not in seen:
                 seen.add(u)
