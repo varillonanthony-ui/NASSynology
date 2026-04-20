@@ -3,37 +3,26 @@ import pandas as pd
 from datetime import datetime
 from synology_manager import DatabaseManager, SynologyManager
 
-st.set_page_config(
-    page_title="Synology Manager",
-    page_icon="🗄️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Synology Manager", page_icon="🗄️", layout="wide")
 
 st.markdown("""
 <style>
     .block-container { padding-top: 2rem; }
     .status-online  { color: #27ae60; font-weight: bold; }
     .status-offline { color: #e74c3c; font-weight: bold; }
-    div[data-testid="metric-container"] {
-        background: white;
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 1rem;
-    }
+    .log-box { background:#1e1e1e; color:#d4d4d4; padding:1rem;
+               border-radius:8px; font-family:monospace; font-size:.85rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Initialisation (une seule fois par session) ────────────────────────────
-if "db" not in st.session_state:
-    st.session_state.db = DatabaseManager()
+if "db"  not in st.session_state:
+    st.session_state.db  = DatabaseManager()
 if "mgr" not in st.session_state:
     st.session_state.mgr = SynologyManager(st.session_state.db)
 
 db  = st.session_state.db
 mgr = st.session_state.mgr
 
-# ─── Sidebar ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🗄️ Synology Manager")
     st.markdown("---")
@@ -47,7 +36,6 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
 
-# ─── Récupérer la liste des NAS ────────────────────────────────────────────
 nas_list = db.get_all_nas()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -60,35 +48,25 @@ if page == "📊 Tableau de bord":
         st.info("Aucun serveur configuré. Allez sur **➕ Ajouter un serveur** pour commencer.")
         st.stop()
 
-    # Métriques globales
-    total  = len(nas_list)
-    unread = len(db.get_alerts(unread_only=True))
     col1, col2, col3 = st.columns(3)
-    col1.metric("Serveurs configurés", total)
-    col2.metric("Alertes non lues",    unread)
-    col3.metric("Dernière vérification", "Maintenant")
-
+    col1.metric("Serveurs",        len(nas_list))
+    col2.metric("Alertes non lues", len(db.get_alerts(unread_only=True)))
+    col3.metric("Vérifié",          datetime.now().strftime("%H:%M"))
     st.markdown("---")
 
     for nas in nas_list:
-        password = db.decrypt_password(nas["dsm_password_enc"])
-
+        pwd = db.decrypt_password(nas["dsm_password_enc"])
         with st.expander(f"🖥️  {nas['name']}  —  {nas.get('location','')}", expanded=True):
             c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
 
-            # ── Statut ──────────────────────────────────────────────────
             with c1:
                 st.write("**Statut**")
-                if st.button("🔄 Vérifier", key=f"status_{nas['id']}"):
+                if st.button("🔄 Vérifier", key=f"st_{nas['id']}"):
                     with st.spinner("Connexion…"):
-                        status = mgr.check_server_status(
-                            nas["qc_id"], nas["dsm_user"], password
-                        )
+                        status = mgr.check_server_status(nas["qc_id"], nas["dsm_user"], pwd)
                         db.update_last_checked(nas["id"])
-                        db.add_history(
-                            nas["id"], "check_status",
-                            "success" if status and status.get("is_online") else "failed"
-                        )
+                        db.add_history(nas["id"], "check_status",
+                            "success" if status and status.get("is_online") else "failed")
                     if status and status.get("is_online"):
                         st.markdown("<span class='status-online'>✅ En ligne</span>",
                                     unsafe_allow_html=True)
@@ -97,60 +75,50 @@ if page == "📊 Tableau de bord":
                     else:
                         st.markdown("<span class='status-offline'>❌ Hors ligne</span>",
                                     unsafe_allow_html=True)
+                if nas.get("last_checked"):
+                    st.caption(f"Vérifié: {nas['last_checked'][:16]}")
 
-                last = nas.get("last_checked")
-                if last:
-                    st.caption(f"Vérifié: {last[:16]}")
-
-            # ── Mises à jour ────────────────────────────────────────────
             with c2:
                 st.write("**Mises à jour**")
                 if st.button("🔍 Vérifier MAJ", key=f"upd_{nas['id']}"):
                     with st.spinner("Vérification…"):
-                        updates = mgr.check_updates(
-                            nas["qc_id"], nas["dsm_user"], password
-                        )
+                        updates = mgr.check_updates(nas["qc_id"], nas["dsm_user"], pwd)
                     if updates:
                         st.warning(f"⬆️ {len(updates)} mise(s) à jour")
-                        if st.button("⬆️ Installer", key=f"install_{nas['id']}"):
-                            mgr.install_updates(nas["qc_id"], nas["dsm_user"], password)
+                        if st.button("⬆️ Installer", key=f"inst_{nas['id']}"):
+                            mgr.install_updates(nas["qc_id"], nas["dsm_user"], pwd)
                             db.add_history(nas["id"], "install_updates", "success")
                             st.success("Mise à jour lancée!")
                     else:
                         st.success("✅ À jour")
 
-            # ── Alertes système ─────────────────────────────────────────
             with c3:
                 st.write("**Alertes système**")
-                if st.button("🔔 Scanner", key=f"alert_{nas['id']}"):
+                if st.button("🔔 Scanner", key=f"al_{nas['id']}"):
                     with st.spinner("Scan…"):
-                        system_alerts = mgr.get_system_alerts(
-                            nas["qc_id"], nas["dsm_user"], password
-                        )
-                    if system_alerts:
-                        for a in system_alerts:
-                            db.add_alert(nas["id"], "system", a["message"],
-                                         a.get("type", "warning"))
-                        st.error(f"🔴 {len(system_alerts)} alerte(s) détectée(s)!")
+                        sys_alerts = mgr.get_system_alerts(nas["qc_id"], nas["dsm_user"], pwd)
+                    if sys_alerts:
+                        for a in sys_alerts:
+                            db.add_alert(nas["id"], "system", a["message"], a.get("type","warning"))
+                        st.error(f"🔴 {len(sys_alerts)} alerte(s)!")
                     else:
                         st.success("✅ Aucune alerte")
 
-            # ── Infos rapides ────────────────────────────────────────────
             with c4:
                 st.write("**Infos**")
                 st.caption(f"ID: `{nas['qc_id']}`")
                 st.caption(f"User: {nas['dsm_user']}")
-                alerts_count = len(db.get_alerts(nas_id=nas["id"], unread_only=True))
-                if alerts_count:
-                    st.error(f"🔴 {alerts_count} alerte(s)")
+                n_alerts = len(db.get_alerts(nas_id=nas["id"], unread_only=True))
+                if n_alerts:
+                    st.error(f"🔴 {n_alerts} alerte(s)")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PAGE 2 : Ajouter un serveur
+# PAGE 2 : Ajouter un serveur  (avec logs de debug)
 # ═══════════════════════════════════════════════════════════════════════════
 elif page == "➕ Ajouter un serveur":
     st.title("➕ Ajouter un serveur Synology")
 
-    with st.form("add_form", clear_on_submit=True):
+    with st.form("add_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
             name      = st.text_input("Nom du serveur *",    placeholder="SPS")
@@ -161,24 +129,40 @@ elif page == "➕ Ajouter un serveur":
             password  = st.text_input("Mot de passe *",       type="password")
             alerts_on = st.checkbox("Activer les alertes",    value=True)
 
-        submitted = st.form_submit_button("➕ Ajouter le serveur", use_container_width=True)
+        submitted = st.form_submit_button("🔌 Tester la connexion & Ajouter",
+                                          use_container_width=True)
 
     if submitted:
         if not all([name, qc_id, user, password]):
             st.error("⚠️ Veuillez remplir tous les champs obligatoires (*)")
         else:
-            with st.spinner("Vérification de la connexion…"):
-                ok = mgr.verify_connection(qc_id, user, password)
+            st.markdown("---")
+            st.subheader("🔍 Logs de connexion")
 
-            if ok:
+            with st.spinner("Connexion en cours…"):
+                result = mgr.verify_connection_debug(qc_id, user, password)
+
+            # Afficher chaque log
+            for log in result["logs"]:
+                if log.startswith("✅"):
+                    st.success(log)
+                elif log.startswith("❌"):
+                    st.error(log)
+                else:
+                    st.info(log)
+
+            # Résultat final
+            st.markdown("---")
+            if result["success"]:
                 added = db.add_nas(name, qc_id, user, password, location, alerts_on)
                 if added:
                     st.success(f"✅ Serveur **{name}** ajouté avec succès!")
                     st.balloons()
                 else:
-                    st.error("❌ Ce Quick Connect ID existe déjà.")
+                    st.error("❌ Ce Quick Connect ID existe déjà en base.")
             else:
-                st.error("❌ Connexion impossible. Vérifiez l'ID QuickConnect et vos identifiants.")
+                st.error(f"❌ Connexion échouée : **{result['error']}**")
+                st.warning("👆 Lisez les logs ci-dessus pour comprendre où ça bloque.")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PAGE 3 : Gérer les serveurs
@@ -190,51 +174,41 @@ elif page == "✏️ Gérer les serveurs":
         st.info("Aucun serveur configuré.")
         st.stop()
 
-    # Tableau récapitulatif
     rows = [{
-        "Nom":         n["name"],
-        "QC ID":       n["qc_id"],
-        "Utilisateur": n["dsm_user"],
-        "Localisation":n.get("location", ""),
-        "Alertes":     "✅" if n.get("enable_alerts") else "❌",
-        "Ajouté":      n["created_at"][:10],
+        "Nom": n["name"], "QC ID": n["qc_id"], "Utilisateur": n["dsm_user"],
+        "Localisation": n.get("location",""), "Alertes": "✅" if n.get("enable_alerts") else "❌",
+        "Ajouté": n["created_at"][:10],
     } for n in nas_list]
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
     st.markdown("---")
 
-    # Modifier un serveur
     st.subheader("✏️ Modifier")
     names    = [n["name"] for n in nas_list]
-    selected = st.selectbox("Choisir un serveur", names, key="edit_sel")
+    selected = st.selectbox("Choisir", names, key="edit_sel")
     nas      = next(n for n in nas_list if n["name"] == selected)
     pwd_dec  = db.decrypt_password(nas["dsm_password_enc"])
 
     with st.form("edit_form"):
         c1, c2 = st.columns(2)
         with c1:
-            new_name   = st.text_input("Nom",              value=nas["name"])
-            new_qcid   = st.text_input("Quick Connect ID", value=nas["qc_id"])
-            new_loc    = st.text_input("Localisation",     value=nas.get("location", ""))
+            new_name  = st.text_input("Nom",              value=nas["name"])
+            new_qcid  = st.text_input("Quick Connect ID", value=nas["qc_id"])
+            new_loc   = st.text_input("Localisation",     value=nas.get("location",""))
         with c2:
-            new_user   = st.text_input("Utilisateur",      value=nas["dsm_user"])
-            new_pwd    = st.text_input("Mot de passe",     value=pwd_dec, type="password")
-            new_alerts = st.checkbox("Alertes activées",   value=bool(nas.get("enable_alerts", 1)))
-
+            new_user  = st.text_input("Utilisateur",      value=nas["dsm_user"])
+            new_pwd   = st.text_input("Mot de passe",     value=pwd_dec, type="password")
+            new_alerts= st.checkbox("Alertes activées",   value=bool(nas.get("enable_alerts",1)))
         if st.form_submit_button("💾 Enregistrer", use_container_width=True):
             db.update_nas(nas["id"], new_name, new_qcid, new_user, new_pwd, new_loc, new_alerts)
-            st.success("✅ Serveur mis à jour!")
+            st.success("✅ Mis à jour!")
             st.rerun()
 
     st.markdown("---")
-
-    # Supprimer
-    st.subheader("🗑️ Supprimer un serveur")
+    st.subheader("🗑️ Supprimer")
     del_name = st.selectbox("Choisir", names, key="del_sel")
     if st.button("🗑️ Supprimer définitivement", type="primary"):
-        nas_to_del = next(n for n in nas_list if n["name"] == del_name)
-        db.delete_nas(nas_to_del["id"])
-        st.success(f"✅ Serveur **{del_name}** supprimé.")
+        db.delete_nas(next(n["id"] for n in nas_list if n["name"] == del_name))
+        st.success(f"✅ Supprimé.")
         st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -242,37 +216,33 @@ elif page == "✏️ Gérer les serveurs":
 # ═══════════════════════════════════════════════════════════════════════════
 elif page == "🚨 Alertes":
     st.title("🚨 Alertes")
-
-    c1, c2 = st.columns([3, 1])
+    c1, c2 = st.columns([3,1])
     with c1:
-        filter_opts = ["Tous les serveurs"] + [n["name"] for n in nas_list]
-        filter_sel  = st.selectbox("Filtrer", filter_opts)
+        filter_sel = st.selectbox("Filtrer", ["Tous"] + [n["name"] for n in nas_list])
     with c2:
-        unread_only = st.checkbox("Non lues uniquement", value=True)
+        unread_only = st.checkbox("Non lues", value=True)
 
-    nas_id_filter = None
-    if filter_sel != "Tous les serveurs":
-        nas_id_filter = next(n["id"] for n in nas_list if n["name"] == filter_sel)
+    nid = None
+    if filter_sel != "Tous":
+        nid = next(n["id"] for n in nas_list if n["name"] == filter_sel)
 
-    alerts = db.get_alerts(nas_id=nas_id_filter, unread_only=unread_only)
-
+    alerts = db.get_alerts(nas_id=nid, unread_only=unread_only)
     if not alerts:
         st.success("✅ Aucune alerte.")
     else:
         for a in alerts:
             icon     = "🔴" if a.get("severity") == "error" else "🟡"
             nas_name = next((n["name"] for n in nas_list if n["id"] == a["nas_id"]), "?")
-            c1, c2, c3 = st.columns([5, 1, 1])
+            c1, c2, c3 = st.columns([5,1,1])
             with c1:
                 st.write(f"{icon} **[{nas_name}]** {a['message']}")
                 st.caption(a["created_at"][:16])
             with c2:
                 st.caption("Lue" if a["is_read"] else "**Non lue**")
             with c3:
-                if not a["is_read"]:
-                    if st.button("✓ Lu", key=f"read_{a['id']}"):
-                        db.mark_alert_read(a["id"])
-                        st.rerun()
+                if not a["is_read"] and st.button("✓", key=f"r_{a['id']}"):
+                    db.mark_alert_read(a["id"])
+                    st.rerun()
             st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -280,27 +250,18 @@ elif page == "🚨 Alertes":
 # ═══════════════════════════════════════════════════════════════════════════
 elif page == "📋 Historique":
     st.title("📋 Historique")
+    filter_sel = st.selectbox("Filtrer", ["Tous"] + [n["name"] for n in nas_list])
+    nid = None
+    if filter_sel != "Tous":
+        nid = next(n["id"] for n in nas_list if n["name"] == filter_sel)
 
-    filter_opts = ["Tous les serveurs"] + [n["name"] for n in nas_list]
-    filter_sel  = st.selectbox("Filtrer", filter_opts)
-
-    nas_id_filter = None
-    if filter_sel != "Tous les serveurs":
-        nas_id_filter = next(n["id"] for n in nas_list if n["name"] == filter_sel)
-
-    history = db.get_history(nas_id=nas_id_filter, limit=100)
-
+    history = db.get_history(nas_id=nid, limit=100)
     if not history:
         st.info("Aucun historique.")
     else:
-        rows = []
-        for h in history:
-            nas_name = next((n["name"] for n in nas_list if n["id"] == h["nas_id"]), "?")
-            rows.append({
-                "Serveur": nas_name,
-                "Action":  h["action"],
-                "Statut":  h["status"],
-                "Détails": h.get("details") or "",
-                "Date":    h["created_at"][:16],
-            })
+        rows = [{
+            "Serveur": next((n["name"] for n in nas_list if n["id"] == h["nas_id"]), "?"),
+            "Action":  h["action"], "Statut": h["status"],
+            "Détails": h.get("details") or "", "Date": h["created_at"][:16],
+        } for h in history]
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
