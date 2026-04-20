@@ -61,6 +61,12 @@ class DatabaseManager:
                 FOREIGN KEY (nas_id) REFERENCES nas(id)
             )
         ''')
+        # Migration : ajouter les colonnes manquantes si table existante
+        try:
+            cursor.execute("ALTER TABLE nas ADD COLUMN direct_url TEXT DEFAULT ''")
+        except:
+            pass  # Colonne déjà présente
+
         conn.commit()
         conn.close()
 
