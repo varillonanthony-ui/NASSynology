@@ -43,8 +43,11 @@ def logout(session, base_url, sid):
     except:
         pass
 
-def get_nas_status(nas: dict) -> dict:
-    """Récupère toutes les infos d'un NAS"""
+def get_nas_status(nas) -> dict:
+    """Récupère toutes les infos d'un NAS. Accepte dict ou frozenset."""
+    if isinstance(nas, frozenset):
+        nas = dict(nas)
+
     base_url = f"https://global.quickconnect.to/{nas['qc_id']}"
 
     result = {
@@ -117,6 +120,8 @@ def get_nas_status(nas: dict) -> dict:
 
 def push_dsm_update(nas: dict) -> dict:
     """Lance la mise à jour DSM"""
+    if isinstance(nas, frozenset):
+        nas = dict(nas)
     base_url = f"https://global.quickconnect.to/{nas['qc_id']}"
     try:
         session, sid = get_dsm_session(base_url, nas["dsm_user"], nas["dsm_password"])
@@ -135,6 +140,8 @@ def push_dsm_update(nas: dict) -> dict:
 
 def push_package_update(nas: dict, package_id: str) -> dict:
     """Met à jour un package spécifique"""
+    if isinstance(nas, frozenset):
+        nas = dict(nas)
     base_url = f"https://global.quickconnect.to/{nas['qc_id']}"
     try:
         session, sid = get_dsm_session(base_url, nas["dsm_user"], nas["dsm_password"])

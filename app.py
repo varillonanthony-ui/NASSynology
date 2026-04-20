@@ -12,7 +12,7 @@ st.set_page_config(
     layout="wide"
 )
 
-init_db()  # Crée la DB si besoin
+init_db()
 
 # ============================================
 # SIDEBAR — GESTION DES NAS
@@ -20,7 +20,6 @@ init_db()  # Crée la DB si besoin
 with st.sidebar:
     st.header("⚙️ Gestion des NAS")
 
-    # --- AJOUT ---
     with st.expander("➕ Ajouter un NAS", expanded=False):
         with st.form("add_nas_form"):
             new_name     = st.text_input("Nom du client *")
@@ -37,44 +36,40 @@ with st.sidebar:
                     ok = add_nas(new_name, new_qc, new_user, new_password, new_location)
                     if ok:
                         st.success(f"✅ {new_name} ajouté !")
-                        st.cache_data.clear()
                         st.rerun()
                     else:
                         st.error("❌ QuickConnect ID déjà existant !")
 
     st.divider()
 
-    # --- LISTE POUR SUPPRIMER / MODIFIER ---
     st.subheader("📋 NAS enregistrés")
-    all_nas = get_all_nas()
+    all_nas_sidebar = get_all_nas()
 
-    if not all_nas:
+    if not all_nas_sidebar:
         st.info("Aucun NAS enregistré")
     else:
-        for nas in all_nas:
+        for nas in all_nas_sidebar:
             with st.expander(f"🖥️ {nas['name']}"):
                 with st.form(f"edit_{nas['id']}"):
-                    e_name     = st.text_input("Nom", value=nas["name"])
+                    e_name     = st.text_input("Nom",           value=nas["name"])
                     e_qc       = st.text_input("QuickConnect ID", value=nas["qc_id"])
-                    e_location = st.text_input("Localisation", value=nas["location"])
-                    e_user     = st.text_input("Utilisateur", value=nas["dsm_user"])
-                    e_password = st.text_input("Mot de passe", type="password",
+                    e_location = st.text_input("Localisation",  value=nas["location"])
+                    e_user     = st.text_input("Utilisateur",   value=nas["dsm_user"])
+                    e_password = st.text_input("Mot de passe",  type="password",
                                                value=nas["dsm_password"])
 
                     col1, col2 = st.columns(2)
-                    save = col1.form_submit_button("💾 Modifier", use_container_width=True)
+                    save   = col1.form_submit_button("💾 Modifier",   use_container_width=True)
                     delete = col2.form_submit_button("🗑️ Supprimer", use_container_width=True)
 
                     if save:
                         update_nas(nas["id"], e_name, e_qc, e_user, e_password, e_location)
                         st.success("Modifié !")
-                        st.cache_data.clear()
                         st.rerun()
 
                     if delete:
                         delete_nas(nas["id"])
                         st.warning(f"{nas['name']} supprimé")
-                        st.cache_data.clear()
                         st.rerun()
 
 # ============================================
@@ -85,7 +80,6 @@ st.title("🖥️ Monitoring NAS Synology")
 col_t, col_r = st.columns([4, 1])
 with col_r:
     if st.button("🔄 Actualiser", use_container_width=True):
-        st.cache_data.clear()
         st.rerun()
 
 all_nas = get_all_nas()
@@ -97,15 +91,7 @@ if not all_nas:
 # ============================================
 # CHARGEMENT STATUTS
 # ============================================
-@st.cache_data(ttl=300)
-def load_all_status(_nas_list):
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        return list(ex.map(get_nas_status, _nas_list))
-
 with st.spinner("🔍 Vérification des NAS en cours..."):
-    statuses = load_all_status(tuple(map(lambda x: frozenset(x.items()), all_nas)))
-    # Fix : passer directement la liste
-    statuses = []
     with ThreadPoolExecutor(max_workers=10) as ex:
         statuses = list(ex.map(get_nas_status, all_nas))
 
@@ -117,10 +103,10 @@ offline       = [n for n in statuses if not n["online"]]
 total_updates = sum(n["updates_available"] for n in statuses)
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("📦 Total NAS",        len(statuses))
-c2.metric("🟢 En ligne",         len(online))
-c3.metric("🔴 Hors ligne",       len(offline))
-c4.metric("⚠️ MAJ disponibles",  total_updates)
+c1.metric("📦 Total NAS",       len(statuses))
+c2.metric("🟢 En ligne",        len(online))
+c3.metric("🔴 Hors ligne",      len(offline))
+c4.metric("⚠️ MAJ disponibles", total_updates)
 
 st.divider()
 
@@ -144,7 +130,6 @@ for i, nas in enumerate(statuses):
             st.write(f"💿 **DSM :** {nas.get('dsm_version') or 'N/A'}")
             st.write(f"🌐 **Hostname :** {nas.get('hostname') or 'N/A'}")
 
-            # ---- MISES À JOUR ----
             if nas["updates_available"] > 0:
                 st.warning(f"⚠️ **{nas['updates_available']} mise(s) à jour disponible(s)**")
 
@@ -160,13 +145,11 @@ for i, nas in enumerate(statuses):
                                 result = push_dsm_update(nas)
                             else:
                                 result = push_package_update(nas, upd["name"])
-
                         if result["success"]:
                             st.success(result["message"])
                         else:
                             st.error(result["message"])
 
-                # Bouton tout mettre à jour
                 if nas["updates_available"] > 1:
                     if st.button(
                         f"⬆️ Tout mettre à jour ({nas['updates_available']})",

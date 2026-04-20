@@ -1,6 +1,4 @@
 import sqlite3
-import streamlit as st
-from datetime import datetime
 
 DB_PATH = "nas.db"
 
@@ -10,13 +8,13 @@ def init_db():
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS nas (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            qc_id       TEXT NOT NULL UNIQUE,
-            dsm_user    TEXT NOT NULL,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            qc_id        TEXT NOT NULL UNIQUE,
+            dsm_user     TEXT NOT NULL,
             dsm_password TEXT NOT NULL,
-            location    TEXT DEFAULT '',
-            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            location     TEXT DEFAULT '',
+            created_at   TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -43,7 +41,7 @@ def add_nas(name, qc_id, user, password, location) -> bool:
         conn.close()
         return True
     except sqlite3.IntegrityError:
-        return False  # QuickConnect ID déjà existant
+        return False
 
 def delete_nas(nas_id: int):
     conn = sqlite3.connect(DB_PATH)
@@ -56,7 +54,7 @@ def update_nas(nas_id, name, qc_id, user, password, location):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        UPDATE nas SET 
+        UPDATE nas SET
             name=?, qc_id=?, dsm_user=?, dsm_password=?, location=?
         WHERE id=?
     """, (name, qc_id, user, password, location, nas_id))
