@@ -1,650 +1,306 @@
-import requests
-import json
-from typing import Optional, Dict, List, Any
-import urllib3
+import streamlit as st
+import pandas as pd
 from datetime import datetime
-import sqlite3
-from pathlib import Path
-import hashlib
-import base64
+from synology_manager import DatabaseManager, SynologyManager
 
-# Désactiver les avertissements SSL
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+st.set_page_config(
+    page_title="Synology Manager",
+    page_icon="🗄️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-class DatabaseManager:
-    """Gestionnaire de base de données SQLite pour la persistance"""
-    
-    def __init__(self, db_path: str = "synology_manager.db"):
-        self.db_path = db_path
-        self.init_database()
-    
-    def init_database(self):
-        """Initialise la base de données avec les tables nécessaires"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Table des serveurs
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS servers (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                sid TEXT NOT NULL,
-                username TEXT NOT NULL,
-                password_encrypted TEXT NOT NULL,
-                enable_alerts INTEGER DEFAULT 1,
-                check_interval INTEGER DEFAULT 6,
-                added_date TEXT NOT NULL,
-                last_checked TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Table des alertes
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                server_id TEXT NOT NULL,
-                alert_type TEXT NOT NULL,
-                message TEXT NOT NULL,
-                severity TEXT DEFAULT 'warning',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_read INTEGER DEFAULT 0,
-                FOREIGN KEY (server_id) REFERENCES servers(id)
-            )
-        ''')
-        
-        # Table de l'historique
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                server_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                status TEXT,
-                details TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (server_id) REFERENCES servers(id)
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def encrypt_password(self, password: str) -> str:
-        """Chiffre un mot de passe (chiffrement simple, améliorer pour production)"""
-        # Pour la production, utiliser cryptography.fernet
-        encoded = base64.b64encode(password.encode()).decode()
-        return encoded
-    
-    def decrypt_password(self, encrypted: str) -> str:
-        """Déchiffre un mot de passe"""
-        try:
-            decoded = base64.b64decode(encrypted.encode()).decode()
-            return decoded
-        except:
-            return encrypted
-    
-    def add_server(self, server_id: str, server_data: Dict) -> bool:
-        """Ajoute un serveur à la base de données"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            encrypted_password = self.encrypt_password(server_data['password'])
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO servers 
-                (id, name, sid, username, password_encrypted, enable_alerts, check_interval, added_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                server_id,
-                server_data['name'],
-                server_data['sid'],
-                server_data['username'],
-                encrypted_password,
-                1 if server_data.get('enable_alerts', True) else 0,
-                server_data.get('check_interval', 6),
-                server_data.get('added_date', datetime.now().isoformat())
-            ))
-            
-            # Ajouter à l'historique
-            cursor.execute('''
-                INSERT INTO history (server_id, action, status)
-                VALUES (?, ?, ?)
-            ''', (server_id, 'added', 'success'))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Erreur lors de l'ajout du serveur: {e}")
-            return False
-    
-    def get_servers(self) -> Dict[str, Dict]:
-        """Récupère tous les serveurs"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT * FROM servers')
-            rows = cursor.fetchall()
-            
-            servers = {}
-            for row in rows:
-                server_id = row[0]
-                servers[server_id] = {
-                    'name': row[1],
-                    'sid': row[2],
-                    'username': row[3],
-                    'password': self.decrypt_password(row[4]),
-                    'enable_alerts': bool(row[5]),
-                    'check_interval': row[6],
-                    'added_date': row[7],
-                    'last_checked': row[8]
-                }
-            
-            conn.close()
-            return servers
-        except Exception as e:
-            print(f"Erreur lors de la récupération des serveurs: {e}")
-            return {}
-    
-    def delete_server(self, server_id: str) -> bool:
-        """Supprime un serveur"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('DELETE FROM servers WHERE id = ?', (server_id,))
-            cursor.execute('DELETE FROM alerts WHERE server_id = ?', (server_id,))
-            cursor.execute('DELETE FROM history WHERE server_id = ?', (server_id,))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Erreur lors de la suppression du serveur: {e}")
-            return False
-    
-    def add_alert(self, server_id: str, alert_type: str, message: str, severity: str = 'warning') -> bool:
-        """Ajoute une alerte à la base de données"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO alerts (server_id, alert_type, message, severity)
-                VALUES (?, ?, ?, ?)
-            ''', (server_id, alert_type, message, severity))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Erreur lors de l'ajout de l'alerte: {e}")
-            return False
-    
-    def get_alerts(self, server_id: Optional[str] = None, unread_only: bool = False) -> List[Dict]:
-        """Récupère les alertes"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            if server_id:
-                if unread_only:
-                    cursor.execute(
-                        'SELECT * FROM alerts WHERE server_id = ? AND is_read = 0 ORDER BY created_at DESC',
-                        (server_id,)
-                    )
+st.markdown("""
+<style>
+    .block-container { padding-top: 2rem; }
+    .status-online  { color: #27ae60; font-weight: bold; }
+    .status-offline { color: #e74c3c; font-weight: bold; }
+    div[data-testid="metric-container"] {
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Initialisation (une seule fois par session) ────────────────────────────
+if "db" not in st.session_state:
+    st.session_state.db = DatabaseManager()
+if "mgr" not in st.session_state:
+    st.session_state.mgr = SynologyManager(st.session_state.db)
+
+db  = st.session_state.db
+mgr = st.session_state.mgr
+
+# ─── Sidebar ───────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("🗄️ Synology Manager")
+    st.markdown("---")
+    page = st.radio("Navigation", [
+        "📊 Tableau de bord",
+        "➕ Ajouter un serveur",
+        "✏️ Gérer les serveurs",
+        "🚨 Alertes",
+        "📋 Historique",
+    ])
+    st.markdown("---")
+    st.caption(f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+# ─── Récupérer la liste des NAS ────────────────────────────────────────────
+nas_list = db.get_all_nas()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE 1 : Tableau de bord
+# ═══════════════════════════════════════════════════════════════════════════
+if page == "📊 Tableau de bord":
+    st.title("📊 Tableau de bord")
+
+    if not nas_list:
+        st.info("Aucun serveur configuré. Allez sur **➕ Ajouter un serveur** pour commencer.")
+        st.stop()
+
+    # Métriques globales
+    total  = len(nas_list)
+    unread = len(db.get_alerts(unread_only=True))
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Serveurs configurés", total)
+    col2.metric("Alertes non lues",    unread)
+    col3.metric("Dernière vérification", "Maintenant")
+
+    st.markdown("---")
+
+    for nas in nas_list:
+        password = db.decrypt_password(nas["dsm_password_enc"])
+
+        with st.expander(f"🖥️  {nas['name']}  —  {nas.get('location','')}", expanded=True):
+            c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+
+            # ── Statut ──────────────────────────────────────────────────
+            with c1:
+                st.write("**Statut**")
+                if st.button("🔄 Vérifier", key=f"status_{nas['id']}"):
+                    with st.spinner("Connexion…"):
+                        status = mgr.check_server_status(
+                            nas["qc_id"], nas["dsm_user"], password
+                        )
+                        db.update_last_checked(nas["id"])
+                        db.add_history(
+                            nas["id"], "check_status",
+                            "success" if status and status.get("is_online") else "failed"
+                        )
+                    if status and status.get("is_online"):
+                        st.markdown("<span class='status-online'>✅ En ligne</span>",
+                                    unsafe_allow_html=True)
+                        if status.get("dsm_version"):
+                            st.caption(f"DSM {status['dsm_version']}")
+                    else:
+                        st.markdown("<span class='status-offline'>❌ Hors ligne</span>",
+                                    unsafe_allow_html=True)
+
+                last = nas.get("last_checked")
+                if last:
+                    st.caption(f"Vérifié: {last[:16]}")
+
+            # ── Mises à jour ────────────────────────────────────────────
+            with c2:
+                st.write("**Mises à jour**")
+                if st.button("🔍 Vérifier MAJ", key=f"upd_{nas['id']}"):
+                    with st.spinner("Vérification…"):
+                        updates = mgr.check_updates(
+                            nas["qc_id"], nas["dsm_user"], password
+                        )
+                    if updates:
+                        st.warning(f"⬆️ {len(updates)} mise(s) à jour")
+                        if st.button("⬆️ Installer", key=f"install_{nas['id']}"):
+                            mgr.install_updates(nas["qc_id"], nas["dsm_user"], password)
+                            db.add_history(nas["id"], "install_updates", "success")
+                            st.success("Mise à jour lancée!")
+                    else:
+                        st.success("✅ À jour")
+
+            # ── Alertes système ─────────────────────────────────────────
+            with c3:
+                st.write("**Alertes système**")
+                if st.button("🔔 Scanner", key=f"alert_{nas['id']}"):
+                    with st.spinner("Scan…"):
+                        system_alerts = mgr.get_system_alerts(
+                            nas["qc_id"], nas["dsm_user"], password
+                        )
+                    if system_alerts:
+                        for a in system_alerts:
+                            db.add_alert(nas["id"], "system", a["message"],
+                                         a.get("type", "warning"))
+                        st.error(f"🔴 {len(system_alerts)} alerte(s) détectée(s)!")
+                    else:
+                        st.success("✅ Aucune alerte")
+
+            # ── Infos rapides ────────────────────────────────────────────
+            with c4:
+                st.write("**Infos**")
+                st.caption(f"ID: `{nas['qc_id']}`")
+                st.caption(f"User: {nas['dsm_user']}")
+                alerts_count = len(db.get_alerts(nas_id=nas["id"], unread_only=True))
+                if alerts_count:
+                    st.error(f"🔴 {alerts_count} alerte(s)")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE 2 : Ajouter un serveur
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "➕ Ajouter un serveur":
+    st.title("➕ Ajouter un serveur Synology")
+
+    with st.form("add_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            name      = st.text_input("Nom du serveur *",    placeholder="SPS")
+            qc_id     = st.text_input("Quick Connect ID *",   placeholder="SPS42")
+            location  = st.text_input("Localisation",         placeholder="Andrezieux")
+        with c2:
+            user      = st.text_input("Nom d'utilisateur *",  placeholder="Varanet")
+            password  = st.text_input("Mot de passe *",       type="password")
+            alerts_on = st.checkbox("Activer les alertes",    value=True)
+
+        submitted = st.form_submit_button("➕ Ajouter le serveur", use_container_width=True)
+
+    if submitted:
+        if not all([name, qc_id, user, password]):
+            st.error("⚠️ Veuillez remplir tous les champs obligatoires (*)")
+        else:
+            with st.spinner("Vérification de la connexion…"):
+                ok = mgr.verify_connection(qc_id, user, password)
+
+            if ok:
+                added = db.add_nas(name, qc_id, user, password, location, alerts_on)
+                if added:
+                    st.success(f"✅ Serveur **{name}** ajouté avec succès!")
+                    st.balloons()
                 else:
-                    cursor.execute(
-                        'SELECT * FROM alerts WHERE server_id = ? ORDER BY created_at DESC',
-                        (server_id,)
-                    )
+                    st.error("❌ Ce Quick Connect ID existe déjà.")
             else:
-                if unread_only:
-                    cursor.execute('SELECT * FROM alerts WHERE is_read = 0 ORDER BY created_at DESC')
-                else:
-                    cursor.execute('SELECT * FROM alerts ORDER BY created_at DESC')
-            
-            rows = cursor.fetchall()
-            alerts = []
-            
-            for row in rows:
-                alerts.append({
-                    'id': row[0],
-                    'server_id': row[1],
-                    'type': row[2],
-                    'message': row[3],
-                    'severity': row[4],
-                    'created_at': row[5],
-                    'is_read': bool(row[6])
-                })
-            
-            conn.close()
-            return alerts
-        except Exception as e:
-            print(f"Erreur lors de la récupération des alertes: {e}")
-            return []
-    
-    def mark_alert_read(self, alert_id: int) -> bool:
-        """Marque une alerte comme lue"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('UPDATE alerts SET is_read = 1 WHERE id = ?', (alert_id,))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Erreur lors de la mise à jour de l'alerte: {e}")
-            return False
-    
-    def get_history(self, server_id: Optional[str] = None, limit: int = 100) -> List[Dict]:
-        """Récupère l'historique des actions"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            if server_id:
-                cursor.execute(
-                    'SELECT * FROM history WHERE server_id = ? ORDER BY created_at DESC LIMIT ?',
-                    (server_id, limit)
-                )
-            else:
-                cursor.execute(
-                    'SELECT * FROM history ORDER BY created_at DESC LIMIT ?',
-                    (limit,)
-                )
-            
-            rows = cursor.fetchall()
-            history = []
-            
-            for row in rows:
-                history.append({
-                    'id': row[0],
-                    'server_id': row[1],
-                    'action': row[2],
-                    'status': row[3],
-                    'details': row[4],
-                    'created_at': row[5]
-                })
-            
-            conn.close()
-            return history
-        except Exception as e:
-            print(f"Erreur lors de la récupération de l'historique: {e}")
-            return []
-    
-    def add_history(self, server_id: str, action: str, status: str = 'pending', details: str = None) -> bool:
-        """Ajoute une entrée à l'historique"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO history (server_id, action, status, details)
-                VALUES (?, ?, ?, ?)
-            ''', (server_id, action, status, details))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Erreur lors de l'ajout à l'historique: {e}")
-            return False
-    
-    def update_last_checked(self, server_id: str) -> bool:
-        """Met à jour la date de dernière vérification"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute(
-                'UPDATE servers SET last_checked = ? WHERE id = ?',
-                (datetime.now().isoformat(), server_id)
-            )
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Erreur lors de la mise à jour de last_checked: {e}")
-            return False
+                st.error("❌ Connexion impossible. Vérifiez l'ID QuickConnect et vos identifiants.")
 
-class SynologyManager:
-    """Gestionnaire pour interagir avec les serveurs Synology via l'API"""
-    
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
-        self.sessions = {}  # Stockage des sessions par server_id
-        self.db = db_manager or DatabaseManager()
-        
-    def get_quickconnect_url(self, sid: str) -> str:
-        """Obtient l'URL du serveur via Quick Connect"""
-        return f"https://{sid}.quickconnect.to"
-    
-    def verify_connection(self, sid: str, username: str, password: str) -> bool:
-        """Vérifie la connexion à un serveur Synology"""
-        try:
-            base_url = self.get_quickconnect_url(sid)
-            
-            # Tentative de connexion
-            session = requests.Session()
-            session.verify = False
-            
-            # Authentification
-            auth_url = f"{base_url}/webapi/auth.cgi"
-            params = {
-                'api': 'SYNO.API.Auth',
-                'version': '3',
-                'method': 'login',
-                'account': username,
-                'passwd': password,
-                'session': 'SynologyManager',
-                'format': 'json'
-            }
-            
-            response = session.get(auth_url, params=params, timeout=10)
-            data = response.json()
-            
-            if data.get('success'):
-                sid_value = data.get('data', {}).get('sid')
-                if sid_value:
-                    self.sessions[sid] = {
-                        'session': session,
-                        'sid': sid_value,
-                        'username': username,
-                        'password': password,
-                        'base_url': base_url
-                    }
-                    return True
-            
-            return False
-        except Exception as e:
-            print(f"Erreur de connexion: {e}")
-            return False
-    
-    def check_server_status(self, sid: str, username: str, password: str) -> Optional[Dict[str, Any]]:
-        """Récupère le statut du serveur"""
-        try:
-            if sid not in self.sessions:
-                if not self.verify_connection(sid, username, password):
-                    return {'is_online': False, 'error': 'Connexion échouée'}
-            
-            session_data = self.sessions.get(sid)
-            if not session_data:
-                return {'is_online': False}
-            
-            session = session_data['session']
-            base_url = session_data['base_url']
-            session_id = session_data['sid']
-            
-            # Récupérer les informations système
-            info_url = f"{base_url}/webapi/query.cgi"
-            params = {
-                'api': 'SYNO.DSM.Info',
-                'version': '2',
-                'method': 'getinfo',
-                '_sid': session_id
-            }
-            
-            response = session.get(info_url, params=params, timeout=10, verify=False)
-            data = response.json()
-            
-            if data.get('success'):
-                sys_info = data.get('data', {})
-                return {
-                    'is_online': True,
-                    'dsm_version': sys_info.get('dsm_version'),
-                    'hostname': sys_info.get('hostname'),
-                    'system_status': sys_info.get('sys_status'),
-                    'uptime': sys_info.get('uptime')
-                }
-            
-            return {'is_online': False}
-        
-        except Exception as e:
-            print(f"Erreur lors de la vérification du statut: {e}")
-            return {'is_online': False, 'error': str(e)}
-    
-    def check_updates(self, sid: str, username: str, password: str) -> Optional[List[Dict]]:
-        """Vérifie les mises à jour disponibles"""
-        try:
-            if sid not in self.sessions:
-                if not self.verify_connection(sid, username, password):
-                    return None
-            
-            session_data = self.sessions.get(sid)
-            if not session_data:
-                return None
-            
-            session = session_data['session']
-            base_url = session_data['base_url']
-            session_id = session_data['sid']
-            
-            # Vérifier les mises à jour disponibles
-            update_url = f"{base_url}/webapi/query.cgi"
-            params = {
-                'api': 'SYNO.DSM.Software',
-                'version': '3',
-                'method': 'check',
-                '_sid': session_id
-            }
-            
-            response = session.get(update_url, params=params, timeout=10, verify=False)
-            data = response.json()
-            
-            if data.get('success'):
-                update_info = data.get('data', {})
-                updates = []
-                
-                if update_info.get('update_available'):
-                    updates.append({
-                        'type': 'dsm',
-                        'version': update_info.get('latest_version'),
-                        'description': 'Mise à jour DSM',
-                        'size': update_info.get('update_size')
-                    })
-                
-                return updates if updates else None
-            
-            return None
-        
-        except Exception as e:
-            print(f"Erreur lors de la vérification des mises à jour: {e}")
-            return None
-    
-    def install_updates(self, sid: str, username: str, password: str) -> bool:
-        """Lance l'installation des mises à jour"""
-        try:
-            if sid not in self.sessions:
-                if not self.verify_connection(sid, username, password):
-                    return False
-            
-            session_data = self.sessions.get(sid)
-            if not session_data:
-                return False
-            
-            session = session_data['session']
-            base_url = session_data['base_url']
-            session_id = session_data['sid']
-            
-            # Lancer l'installation des mises à jour
-            install_url = f"{base_url}/webapi/query.cgi"
-            params = {
-                'api': 'SYNO.DSM.Software',
-                'version': '3',
-                'method': 'install',
-                '_sid': session_id
-            }
-            
-            response = session.get(install_url, params=params, timeout=10, verify=False)
-            data = response.json()
-            
-            return data.get('success', False)
-        
-        except Exception as e:
-            print(f"Erreur lors de l'installation des mises à jour: {e}")
-            return False
-    
-    def get_system_alerts(self, sid: str, username: str, password: str) -> List[Dict[str, Any]]:
-        """Récupère les alertes système (disque, ventilateur, etc.)"""
-        try:
-            if sid not in self.sessions:
-                if not self.verify_connection(sid, username, password):
-                    return []
-            
-            session_data = self.sessions.get(sid)
-            if not session_data:
-                return []
-            
-            session = session_data['session']
-            base_url = session_data['base_url']
-            session_id = session_data['sid']
-            
-            alerts = []
-            
-            # Vérifier la santé du système
-            health_url = f"{base_url}/webapi/query.cgi"
-            params = {
-                'api': 'SYNO.System.Event.Service',
-                'version': '1',
-                'method': 'get',
-                '_sid': session_id
-            }
-            
-            try:
-                response = session.get(health_url, params=params, timeout=10, verify=False)
-                data = response.json()
-                
-                if data.get('success'):
-                    events = data.get('data', {}).get('events', [])
-                    for event in events:
-                        if event.get('severity') in ['critical', 'major']:
-                            alerts.append({
-                                'type': 'error' if event.get('severity') == 'critical' else 'warning',
-                                'message': event.get('description', 'Alerte système'),
-                                'timestamp': datetime.now().isoformat()
-                            })
-            except:
-                pass
-            
-            # Vérifier l'état des disques
-            disk_url = f"{base_url}/webapi/query.cgi"
-            params = {
-                'api': 'SYNO.Storage.CGI.HddMan',
-                'version': '1',
-                'method': 'get',
-                '_sid': session_id
-            }
-            
-            try:
-                response = session.get(disk_url, params=params, timeout=10, verify=False)
-                data = response.json()
-                
-                if data.get('success'):
-                    disks = data.get('data', {}).get('disks', [])
-                    for disk in disks:
-                        if disk.get('status') != 'normal':
-                            alerts.append({
-                                'type': 'error',
-                                'message': f"⚠️ Disque {disk.get('name', 'inconnu')}: {disk.get('status', 'Erreur')}",
-                                'timestamp': datetime.now().isoformat()
-                            })
-            except:
-                pass
-            
-            # Vérifier les ventilateurs
-            fan_url = f"{base_url}/webapi/query.cgi"
-            params = {
-                'api': 'SYNO.System.HardwareInfo',
-                'version': '1',
-                'method': 'getFan',
-                '_sid': session_id
-            }
-            
-            try:
-                response = session.get(fan_url, params=params, timeout=10, verify=False)
-                data = response.json()
-                
-                if data.get('success'):
-                    fans = data.get('data', {}).get('fans', [])
-                    for fan in fans:
-                        if not fan.get('status', True):
-                            alerts.append({
-                                'type': 'error',
-                                'message': f"🔴 Ventilateur {fan.get('name', 'inconnu')} HS",
-                                'timestamp': datetime.now().isoformat()
-                            })
-            except:
-                pass
-            
-            return alerts
-        
-        except Exception as e:
-            print(f"Erreur lors de la récupération des alertes: {e}")
-            return []
-    
-    def get_disk_info(self, sid: str, username: str, password: str) -> Optional[List[Dict]]:
-        """Récupère les informations sur les disques"""
-        try:
-            if sid not in self.sessions:
-                if not self.verify_connection(sid, username, password):
-                    return None
-            
-            session_data = self.sessions.get(sid)
-            if not session_data:
-                return None
-            
-            session = session_data['session']
-            base_url = session_data['base_url']
-            session_id = session_data['sid']
-            
-            disk_url = f"{base_url}/webapi/query.cgi"
-            params = {
-                'api': 'SYNO.Storage.CGI.HddMan',
-                'version': '1',
-                'method': 'get',
-                '_sid': session_id
-            }
-            
-            response = session.get(disk_url, params=params, timeout=10, verify=False)
-            data = response.json()
-            
-            if data.get('success'):
-                return data.get('data', {}).get('disks', [])
-            
-            return None
-        
-        except Exception as e:
-            print(f"Erreur lors de la récupération des informations disque: {e}")
-            return None
-    
-    def logout(self, sid: str) -> bool:
-        """Déconnecte une session"""
-        try:
-            if sid not in self.sessions:
-                return True
-            
-            session_data = self.sessions.get(sid)
-            session = session_data['session']
-            base_url = session_data['base_url']
-            session_id = session_data['sid']
-            
-            logout_url = f"{base_url}/webapi/auth.cgi"
-            params = {
-                'api': 'SYNO.API.Auth',
-                'version': '1',
-                'method': 'logout',
-                '_sid': session_id
-            }
-            
-            session.get(logout_url, params=params, timeout=10, verify=False)
-            del self.sessions[sid]
-            return True
-        
-        except Exception as e:
-            print(f"Erreur lors de la déconnexion: {e}")
-            return False
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE 3 : Gérer les serveurs
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "✏️ Gérer les serveurs":
+    st.title("✏️ Gérer les serveurs")
+
+    if not nas_list:
+        st.info("Aucun serveur configuré.")
+        st.stop()
+
+    # Tableau récapitulatif
+    rows = [{
+        "Nom":         n["name"],
+        "QC ID":       n["qc_id"],
+        "Utilisateur": n["dsm_user"],
+        "Localisation":n.get("location", ""),
+        "Alertes":     "✅" if n.get("enable_alerts") else "❌",
+        "Ajouté":      n["created_at"][:10],
+    } for n in nas_list]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    st.markdown("---")
+
+    # Modifier un serveur
+    st.subheader("✏️ Modifier")
+    names    = [n["name"] for n in nas_list]
+    selected = st.selectbox("Choisir un serveur", names, key="edit_sel")
+    nas      = next(n for n in nas_list if n["name"] == selected)
+    pwd_dec  = db.decrypt_password(nas["dsm_password_enc"])
+
+    with st.form("edit_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            new_name   = st.text_input("Nom",              value=nas["name"])
+            new_qcid   = st.text_input("Quick Connect ID", value=nas["qc_id"])
+            new_loc    = st.text_input("Localisation",     value=nas.get("location", ""))
+        with c2:
+            new_user   = st.text_input("Utilisateur",      value=nas["dsm_user"])
+            new_pwd    = st.text_input("Mot de passe",     value=pwd_dec, type="password")
+            new_alerts = st.checkbox("Alertes activées",   value=bool(nas.get("enable_alerts", 1)))
+
+        if st.form_submit_button("💾 Enregistrer", use_container_width=True):
+            db.update_nas(nas["id"], new_name, new_qcid, new_user, new_pwd, new_loc, new_alerts)
+            st.success("✅ Serveur mis à jour!")
+            st.rerun()
+
+    st.markdown("---")
+
+    # Supprimer
+    st.subheader("🗑️ Supprimer un serveur")
+    del_name = st.selectbox("Choisir", names, key="del_sel")
+    if st.button("🗑️ Supprimer définitivement", type="primary"):
+        nas_to_del = next(n for n in nas_list if n["name"] == del_name)
+        db.delete_nas(nas_to_del["id"])
+        st.success(f"✅ Serveur **{del_name}** supprimé.")
+        st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE 4 : Alertes
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "🚨 Alertes":
+    st.title("🚨 Alertes")
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        filter_opts = ["Tous les serveurs"] + [n["name"] for n in nas_list]
+        filter_sel  = st.selectbox("Filtrer", filter_opts)
+    with c2:
+        unread_only = st.checkbox("Non lues uniquement", value=True)
+
+    nas_id_filter = None
+    if filter_sel != "Tous les serveurs":
+        nas_id_filter = next(n["id"] for n in nas_list if n["name"] == filter_sel)
+
+    alerts = db.get_alerts(nas_id=nas_id_filter, unread_only=unread_only)
+
+    if not alerts:
+        st.success("✅ Aucune alerte.")
+    else:
+        for a in alerts:
+            icon     = "🔴" if a.get("severity") == "error" else "🟡"
+            nas_name = next((n["name"] for n in nas_list if n["id"] == a["nas_id"]), "?")
+            c1, c2, c3 = st.columns([5, 1, 1])
+            with c1:
+                st.write(f"{icon} **[{nas_name}]** {a['message']}")
+                st.caption(a["created_at"][:16])
+            with c2:
+                st.caption("Lue" if a["is_read"] else "**Non lue**")
+            with c3:
+                if not a["is_read"]:
+                    if st.button("✓ Lu", key=f"read_{a['id']}"):
+                        db.mark_alert_read(a["id"])
+                        st.rerun()
+            st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE 5 : Historique
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "📋 Historique":
+    st.title("📋 Historique")
+
+    filter_opts = ["Tous les serveurs"] + [n["name"] for n in nas_list]
+    filter_sel  = st.selectbox("Filtrer", filter_opts)
+
+    nas_id_filter = None
+    if filter_sel != "Tous les serveurs":
+        nas_id_filter = next(n["id"] for n in nas_list if n["name"] == filter_sel)
+
+    history = db.get_history(nas_id=nas_id_filter, limit=100)
+
+    if not history:
+        st.info("Aucun historique.")
+    else:
+        rows = []
+        for h in history:
+            nas_name = next((n["name"] for n in nas_list if n["id"] == h["nas_id"]), "?")
+            rows.append({
+                "Serveur": nas_name,
+                "Action":  h["action"],
+                "Statut":  h["status"],
+                "Détails": h.get("details") or "",
+                "Date":    h["created_at"][:16],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
